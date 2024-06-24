@@ -1,11 +1,13 @@
-use std::{collections::BTreeMap, fmt::Write, path::PathBuf, str::FromStr, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, str::FromStr, time::Duration};
 
 use chrono::{DateTime, Utc};
 use console::style;
-use indicatif::{MultiProgress, ProgressBar, ProgressState, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncWriteExt, BufWriter};
+
+use crate::progress_bar::file_progress_bar;
 
 /// Executes the download command.
 pub async fn execute() -> anyhow::Result<()> {
@@ -47,7 +49,9 @@ pub async fn execute() -> anyhow::Result<()> {
             .await?
             .error_for_status()?;
         let text = response.text().await?;
-        let dump_status = serde_json::from_str::<DumpStatus>(&text)?;
+        let mut dump_status = serde_json::from_str::<DumpStatus>(&text)?;
+        dump_status.fix_paths();
+        dump_status.date = Some(dir.to_owned());
 
         if dump_status.jobs.done() {
             spinner.finish_with_message(format!("Using version {}", style(dir).bright().bold()));
@@ -77,13 +81,8 @@ async fn execute_dump(client: &Client, dump_status: DumpStatus) -> anyhow::Resul
 
     for (file, status) in all_files {
         main_progress.set_message(format!("Downloading {file}"));
-        let file_progress = ProgressBar::new(status.size);
-        file_progress.set_style(ProgressStyle::with_template("{spinner:.green} {msg} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta_precise})")
-            .unwrap()
-            .with_key("eta", |state: &ProgressState, w: &mut dyn Write| write!(w, "{:.1}s", state.eta().as_secs_f64()).unwrap())
-            .progress_chars("#>-"));
-        file_progress.enable_steady_tick(Duration::from_millis(100));
-        download_file(client, &file, &status, &file_progress).await?;
+        let file_progress = file_progress_bar(status.size);
+        download_file(client, &status, &file_progress).await?;
         main_progress.inc(1);
         multi_progress.remove(&file_progress);
     }
@@ -95,13 +94,10 @@ async fn execute_dump(client: &Client, dump_status: DumpStatus) -> anyhow::Resul
 
 async fn download_file(
     client: &Client,
-    file: &str,
     status: &FileStatus,
     progress: &ProgressBar,
 ) -> anyhow::Result<()> {
-    let local_path = PathBuf::from_str("data")
-        .unwrap()
-        .join(&status.url.trim_start_matches('/'));
+    let local_path = PathBuf::from_str("data").unwrap().join(&status.url);
     if tokio::fs::metadata(&local_path)
         .await
         .is_ok_and(|metadata| metadata.is_file())
@@ -134,27 +130,45 @@ async fn download_file(
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct DumpStatus {
-    jobs: JobsStatus,
-    version: String,
+pub struct DumpStatus {
+    pub date: Option<String>,
+    pub jobs: JobsStatus,
+    pub version: String,
+}
+
+impl DumpStatus {
+    pub fn fix_paths(&mut self) {
+        self.jobs.fix_paths();
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct JobsStatus {
+pub struct JobsStatus {
     #[serde(rename = "sitestatstable")]
-    site_stats: JobStatus,
+    pub site_stats: JobStatus,
+    #[serde(rename = "allpagetitlesdump")]
+    pub all_page_titles_dump: JobStatus,
     #[serde(rename = "articlesmultistreamdump")]
-    articles_multistream_dump: JobStatus,
+    pub articles_multistream_dump: JobStatus,
 }
 
 impl JobsStatus {
     pub fn done(&self) -> bool {
-        self.articles_multistream_dump.done() && self.site_stats.done()
+        self.site_stats.done()
+            && self.all_page_titles_dump.done()
+            && self.articles_multistream_dump.done()
+    }
+
+    pub fn fix_paths(&mut self) {
+        self.site_stats.fix_paths();
+        self.all_page_titles_dump.fix_paths();
+        self.articles_multistream_dump.fix_paths();
     }
 
     pub fn all_files(&self) -> Vec<(String, FileStatus)> {
         vec![
             self.site_stats.files(),
+            self.all_page_titles_dump.files(),
             self.articles_multistream_dump.files(),
         ]
         .into_iter()
@@ -165,9 +179,9 @@ impl JobsStatus {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "lowercase")]
-enum JobStatus {
+pub enum JobStatus {
     Done {
-        updated: CustomDateTime,
+        updated: WikiDateTime,
         files: BTreeMap<String, FileStatus>,
     },
     Waiting {},
@@ -176,6 +190,17 @@ enum JobStatus {
 impl JobStatus {
     pub fn done(&self) -> bool {
         matches!(self, JobStatus::Done { .. })
+    }
+
+    pub fn fix_paths(&mut self) {
+        match self {
+            JobStatus::Done { files, .. } => {
+                for file in files.values_mut() {
+                    file.url = file.url.trim_start_matches('/').to_owned();
+                }
+            }
+            JobStatus::Waiting {} => {}
+        }
     }
 
     pub fn files(&self) -> Vec<(String, FileStatus)> {
@@ -190,14 +215,14 @@ impl JobStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct FileStatus {
-    size: u64,
-    url: String,
-    md5: String,
+pub struct FileStatus {
+    pub size: u64,
+    pub url: String,
+    pub md5: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct CustomDateTime(#[serde(with = "custom_date_format")] DateTime<Utc>);
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct WikiDateTime(#[serde(with = "custom_date_format")] pub DateTime<Utc>);
 
 #[allow(dead_code)]
 mod custom_date_format {
