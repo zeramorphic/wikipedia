@@ -4,25 +4,28 @@ use percent_encoding::percent_decode_str;
 
 use crate::hierarchical_map::HierarchicalMap;
 
-pub fn id_to_title() -> anyhow::Result<TitleMap> {
-    // If we haven't already saved the title map to disk, we need to compute it in its entirety, then save it to disk.
-    let rx = crate::page::page_stream(u64::MAX, 1, "Precomputing page IDs".to_owned(), |page| {
-        (page.id, page.title.to_owned())
-    })?;
+pub fn generate_title_map(full: bool) -> anyhow::Result<TitleMap> {
+    let id_to_title = TitleMap::default();
+    if !id_to_title.deserialise(full)? {
+        // If we haven't already saved the title map to disk, we need to compute it in its entirety, then save it to disk.
+        let rx =
+            crate::page::page_stream(u64::MAX, 1, "Precomputing page IDs".to_owned(), |page| {
+                (page.id, page.title.to_owned())
+            })?;
 
-    let mut id_to_title = TitleMap::default();
-    while let Ok((id, title)) = rx.recv() {
-        id_to_title.insert(id, canonicalise_wikilink(&title));
+        while let Ok((id, title)) = rx.recv() {
+            id_to_title.insert(id, canonicalise_wikilink(&title));
+        }
+
+        id_to_title.mark_loaded();
+        println!("{id_to_title}");
+        id_to_title.serialise()?;
     }
-
-    id_to_title.mark_loaded();
-    println!("{id_to_title}");
-    id_to_title.serialise()?;
 
     Ok(id_to_title)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TitleMap {
     id_to_title: HierarchicalMap<u8, u32, String>,
     title_to_id: HierarchicalMap<String, String, u32>,
@@ -31,8 +34,10 @@ pub struct TitleMap {
 impl Default for TitleMap {
     fn default() -> Self {
         Self {
-            id_to_title: HierarchicalMap::new(id_short_key),
-            title_to_id: HierarchicalMap::new(|string: &String| title_short_key(string)),
+            id_to_title: HierarchicalMap::new(PathBuf::from("id_to_title"), id_short_key),
+            title_to_id: HierarchicalMap::new(PathBuf::from("title_to_id"), |string: &String| {
+                title_short_key(string)
+            }),
         }
     }
 }
@@ -102,16 +107,20 @@ impl TitleMap {
         self.title_to_id.mark_loaded();
     }
 
-    fn insert(&mut self, id: u32, title: String) {
+    fn insert(&self, id: u32, title: String) {
         let title = canonicalise_wikilink(&title);
         self.id_to_title.insert(id, title.clone());
         self.title_to_id.insert(title, id);
     }
 
     fn serialise(&self) -> anyhow::Result<()> {
-        self.id_to_title.serialize(PathBuf::from("id_to_title"))?;
-        self.title_to_id.serialize(PathBuf::from("title_to_id"))?;
+        self.id_to_title.serialize()?;
+        self.title_to_id.serialize()?;
         Ok(())
+    }
+
+    fn deserialise(&self, full: bool) -> anyhow::Result<bool> {
+        Ok(self.id_to_title.deserialize(full)? && self.title_to_id.deserialize(full)?)
     }
 }
 

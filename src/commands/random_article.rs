@@ -1,35 +1,36 @@
-use std::sync::Arc;
+use rand::Rng;
 
 use crate::{
-    page::{get_dump_status, page_stream},
-    parse::wikitext::find_links,
-    titles::id_to_title,
+    page::{get_dump_status, page_information},
+    titles::generate_title_map,
 };
 
 pub fn execute() -> anyhow::Result<()> {
-    let id_to_title = Arc::new(id_to_title()?);
+    let dump_status = get_dump_status()?;
+    let title_map = generate_title_map(false)?;
 
-    /*
-    let stream = page_stream(1, 1, "Scanning page links".to_owned(), move |page| {
-        let id_to_title = id_to_title.clone();
-        (
-            page.id,
-            find_links(page.revision.text)
-                .iter()
-                .map(|link| {
-                    let id = id_to_title.get_id(link.target);
-                    if id.is_none() {
-                        eprintln!("Could not resolve Wikilink {} on page {}", link, page.title)
-                    }
-                    id
-                })
-                .collect::<Vec<_>>(),
-        )
-    })?;
+    let random_id = loop {
+        let random_id = rand::thread_rng().gen_range(0..100_000_000u32);
+        println!("Trying ID {random_id}");
+        match title_map.get_title(random_id) {
+            Some(title) => {
+                println!("Found article {title}");
+                let is_redirect =
+                    page_information(&dump_status, 20324344, |page| page.redirect.is_some())?;
+                if is_redirect {
+                    println!("This article is a redirect; ignoring");
+                } else {
+                    break random_id;
+                }
+            }
+            None => {
+                println!("ID {random_id} was not an article");
+            }
+        }
+    };
 
-    while let Ok((id, targets)) = stream.recv() {
-        println!("Page {id} has {} link targets", targets.len());
-    } */
+    let title = title_map.get_title(random_id).unwrap();
+    println!("Generated random article with id {random_id} and title {title}",);
 
     Ok(())
 }

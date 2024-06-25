@@ -23,10 +23,10 @@ use crate::{
 /// Yields some `'static` information about a page given by its ID.
 /// Don't use this function multiple times in quick succession: this opens the index and article files.
 pub fn page_information<T: 'static>(
+    dump_status: &DumpStatus,
     id: u32,
     information: impl for<'a> FnOnce(ParsedPage<'a>) -> T,
 ) -> anyhow::Result<T> {
-    let dump_status = get_dump_status()?;
     let files = dump_status.jobs.articles_multistream_dump.files();
     for (_, articles) in files.iter().filter(|(file, _)| !file.contains("index")) {
         let index_url = articles
