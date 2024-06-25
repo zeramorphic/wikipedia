@@ -14,6 +14,7 @@ use crossbeam::channel::Receiver;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    binary_search_line::binary_search_line_in_file,
     commands::download::DumpStatus,
     memoise::memoise,
     parse::xml::{make_errors_static, parse_element, parse_whitespace, shorten, Element},
@@ -45,41 +46,39 @@ pub fn page_information<T: 'static>(
         let (start, end) = (start.parse::<u32>().unwrap(), end.parse::<u32>().unwrap());
 
         if start <= id && id <= end {
-            // Search through the index file to find the right block to find the page.
+            // Binary search through the index file to find the right block to find the page.
             let mut articles_file =
                 std::fs::File::open(PathBuf::from_str("data")?.join(&articles.url))?;
-            let articles_index_file =
+            let mut articles_index_file =
                 std::fs::File::open(PathBuf::from_str("data")?.join(&index_url))?;
-            let lines = BufReader::new(articles_index_file).lines();
 
-            let id_string = id.to_string();
+            let line = binary_search_line_in_file(
+                &mut articles_index_file,
+                |line| {
+                    let (_byte_offset, line) = line.split_once(':').unwrap();
+                    let (article_id, _article_title) = line.split_once(':').unwrap();
+                    article_id.parse().unwrap()
+                },
+                &id,
+            )?
+            .unwrap();
 
-            for line in lines {
-                let line = line?;
-                if line.is_empty() {
-                    continue;
-                }
-
-                let (byte_offset, line) = line.split_once(':').unwrap();
-                let (article_id, _article_title) = line.split_once(':').unwrap();
-
-                if article_id == id_string {
-                    let article_id = article_id.parse::<u32>()?;
-                    let pages = read_pages(&mut articles_file, byte_offset.parse()?)?;
-                    let mut input = pages.as_str();
-                    while !input.is_empty() {
-                        let (new_input, _) = make_errors_static(parse_whitespace(input))?;
-                        let (new_input, page) = make_errors_static(parse_element(new_input))?;
-                        let (new_input, _) = make_errors_static(parse_whitespace(new_input))?;
-                        input = new_input;
-                        let page = ParsedPage::from(page);
-                        if page.id == article_id {
-                            return Ok(information(page));
-                        }
-                    }
-                    break;
+            let (byte_offset, line) = line.split_once(':').unwrap();
+            let (article_id, _article_title) = line.split_once(':').unwrap();
+            let article_id = article_id.parse::<u32>()?;
+            let pages = read_pages(&mut articles_file, byte_offset.parse()?)?;
+            let mut input = pages.as_str();
+            while !input.is_empty() {
+                let (new_input, _) = make_errors_static(parse_whitespace(input))?;
+                let (new_input, page) = make_errors_static(parse_element(new_input))?;
+                let (new_input, _) = make_errors_static(parse_whitespace(new_input))?;
+                input = new_input;
+                let page = ParsedPage::from(page);
+                if page.id == article_id {
+                    return Ok(information(page));
                 }
             }
+            break;
         }
     }
     panic!("id {id} not in range")

@@ -64,9 +64,9 @@ impl<'a> Element<'a> {
     }
 }
 
-pub fn make_errors_static<'a, T>(
-    result: IResult<&'a str, T>,
-) -> Result<(&'a str, T), nom::Err<nom::error::Error<String>>> {
+pub fn make_errors_static<T>(
+    result: IResult<&str, T>,
+) -> Result<(&str, T), nom::Err<nom::error::Error<String>>> {
     result.map_err(|err| {
         err.map(|err| nom::error::Error {
             input: err.input.to_owned(),
@@ -115,8 +115,8 @@ fn parse_open_tag(input: &str) -> IResult<&str, (Element, bool)> {
         input = new_input;
     }
 
-    if input.starts_with("/>") {
-        Ok((&input[2..], (element, true)))
+    if let Some(input) = input.strip_prefix("/>") {
+        Ok((input, (element, true)))
     } else {
         let (input, _) = tag(">")(input)?;
         Ok((input, (element, false)))
@@ -137,11 +137,8 @@ pub fn parse_element(input: &str) -> IResult<&str, Element> {
         return Ok((input, element));
     }
 
-    match element.name {
-        "hr" => {
-            return Ok((input, element));
-        }
-        _ => {}
+    if element.name == "hr" {
+        return Ok((input, element));
     }
 
     let (input, text) = take_while(|c: char| c != '<')(input)?;

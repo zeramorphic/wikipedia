@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     fmt::{Debug, Display},
     fs::File,
-    io::{BufRead, BufReader, BufWriter, Seek, Write},
+    io::{BufRead, BufReader, BufWriter, Write},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -11,6 +11,8 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+
+use crate::binary_search_line::binary_search_line_in_file;
 
 type LockedBTreeMap<K, V> = Arc<RwLock<BTreeMap<K, V>>>;
 
@@ -300,69 +302,24 @@ impl<K, L, V> HierarchicalMap<K, L, V> {
     }
 }
 
-/// Returns the next complete line in the given file starting at the given byte offset.
-fn next_line_starting_at(file: &mut File, start: u64) -> anyhow::Result<Option<String>> {
-    file.seek(std::io::SeekFrom::Start(start))?;
-    // We'll use a very small capacity because lines are short.
-    let mut reader = BufReader::with_capacity(0x200, file);
-
-    // If start > 0, skip the first line, because it could be incomplete.
-    if start > 0 {
-        let mut buf = Vec::new();
-        reader.read_until(b'\n', &mut buf)?;
-    }
-    // Now read a full line.
-    let mut buf = Vec::new();
-    reader.read_until(b'\n', &mut buf)?;
-
-    Ok(Some(String::from_utf8(buf)?))
-}
-
 /// Performs a binary search on the given file to try to find the given key-value pair.
 fn find_entry_in_file<L, V>(file: &mut File, key: &L) -> anyhow::Result<Option<V>>
 where
     L: Ord + for<'a> Deserialize<'a>,
     V: for<'a> Deserialize<'a>,
 {
-    let mut guess_min = 0u64;
-    let mut guess_max = file.metadata()?.len();
-
-    loop {
-        // If the difference between `guess_max` and `guess_min` is two or less,
-        // there is only one possible line we could obtain by guessing.
-        let one_option = guess_max - guess_min <= 2;
-
-        let guess = if one_option {
-            // This makes sure that the entry at the start of the file is correctly read.
-            guess_min
-        } else {
-            (guess_min + guess_max) / 2
-        };
-
-        let next_line = match next_line_starting_at(file, guess)? {
-            Some(next_line) if !next_line.is_empty() => next_line,
-            _ => {
-                // We're too late into the file to have a next line.
-                // The simplest solution is just to decrement `guess_max` by two, so that `guess` decrements by one.
-                guess_max = guess_max.saturating_sub(2);
-                continue;
-            }
-        };
-        let (found_key, value): (L, V) = serde_json::from_str(&next_line)?;
-
-        match key.cmp(&found_key) {
-            std::cmp::Ordering::Less => {
-                guess_max = guess;
-            }
-            std::cmp::Ordering::Equal => return Ok(Some(value)),
-            std::cmp::Ordering::Greater => {
-                guess_min = guess;
-            }
-        }
-
-        if one_option {
-            // We didn't find the result even though there was only one possible answer.
-            return Ok(None);
-        }
-    }
+    binary_search_line_in_file(
+        file,
+        |line| {
+            let (key, _): (L, V) = serde_json::from_str(line).unwrap();
+            key
+        },
+        key,
+    )
+    .map(|line| {
+        line.map(|line| {
+            let (_, value): (L, V) = serde_json::from_str(&line).unwrap();
+            value
+        })
+    })
 }

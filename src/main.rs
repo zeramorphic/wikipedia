@@ -5,6 +5,7 @@ pub mod parse;
 pub mod progress_bar;
 pub mod hierarchical_map;
 pub mod titles;
+pub mod binary_search_line;
 
 use clap::{Parser, Subcommand};
 
