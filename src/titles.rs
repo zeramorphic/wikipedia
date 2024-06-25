@@ -126,6 +126,15 @@ impl TitleMap {
 
 /// <https://en.wikipedia.org/wiki/Help:Link#Conversion_to_canonical_form>
 pub fn canonicalise_wikilink(input: &str) -> String {
+    let input = match String::from_utf8(percent_decode_str(input).collect::<Vec<_>>()) {
+        Ok(string) => string,
+        Err(_) => {
+            // There are unfortunately some instances of invalid %-sequences in the Wikipedia corpus.
+            input.to_owned()
+        }
+    };
+    let input = html_escape::decode_html_entities(&input);
+
     let (namespace, input) = match input.split_once(':') {
         Some((namespace, remaining_input)) => {
             let namespace = match namespace.trim().to_lowercase().as_str() {
@@ -148,31 +157,71 @@ pub fn canonicalise_wikilink(input: &str) -> String {
             };
             match namespace {
                 Some(namespace) => (Some(namespace), remaining_input),
-                None => (None, input),
+                None => (None, input.as_ref()),
             }
         }
-        None => (None, input),
+        None => (None, input.as_ref()),
     };
 
-    let unescaped = String::from_utf8(percent_decode_str(input).collect::<Vec<_>>()).unwrap();
-    let unescaped = html_escape::decode_html_entities(&unescaped);
+    let input = match input.chars().next() {
+        Some(first_letter) => first_letter
+            .to_uppercase()
+            .chain(input.chars().skip(1))
+            .collect::<String>(),
+        None => input.to_owned(),
+    };
 
-    let title_case = unescaped
-        .chars()
-        .next()
-        .unwrap()
-        .to_uppercase()
-        .chain(input.chars().skip(1))
-        .collect::<String>();
-
-    let no_underscores = title_case
+    let input = input
         .replace("_", " ")
         .split(' ')
         .collect::<Vec<_>>()
         .join(" ");
 
     match namespace {
-        Some(namespace) => format!("{namespace}:{no_underscores}"),
-        None => no_underscores,
+        Some(namespace) => format!("{namespace}:{input}"),
+        None => input,
     }
+}
+
+/// Splits this title into a namespace and the remainder.
+///
+/// https://en.wikipedia.org/wiki/Help:Link
+pub fn split_namespace(title: &str) -> (Option<&'static str>, &str) {
+    let title = title.strip_prefix(':').unwrap_or(title);
+    match title.split_once(':') {
+        Some((namespace, remainder)) => {
+            let namespace = match namespace.trim().to_lowercase().as_str() {
+                "main" => Some("Main"),
+                "article" => Some("Article"),
+                "user" => Some("User"),
+                "wikipedia" => Some("Wikipedia"),
+                "file" => Some("File"),
+                "mediawiki" => Some("MediaWiki"),
+                "template" => Some("Template"),
+                "help" => Some("Help"),
+                "category" => Some("Category"),
+                "portal" => Some("Portal"),
+                "draft" => Some("Draft"),
+                "timedtext" => Some("TimedText"),
+                "module" => Some("Module"),
+                "special" => Some("Special"),
+                "media" => Some("Media"),
+                _ => None,
+            };
+            match namespace {
+                Some(namespace) => (Some(namespace), remainder),
+                None => (None, title),
+            }
+        }
+        None => (None, title),
+    }
+}
+
+pub fn is_interwiki_link(title: &str) -> bool {
+    let prefixes = ["wikibooks"];
+
+    let title = title.strip_prefix(':').unwrap_or(title).to_lowercase();
+    prefixes
+        .iter()
+        .any(|prefix| title.starts_with(&format!("{prefix}:")))
 }

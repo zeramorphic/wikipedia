@@ -10,9 +10,10 @@ use std::{
     },
 };
 
+use crossbeam::channel::Receiver;
 use serde::{Deserialize, Serialize};
 
-use crate::binary_search_line::binary_search_line_in_file;
+use crate::{binary_search_line::binary_search_line_in_file, progress_bar};
 
 type LockedBTreeMap<K, V> = Arc<RwLock<BTreeMap<K, V>>>;
 
@@ -23,7 +24,6 @@ type LockedBTreeMap<K, V> = Arc<RwLock<BTreeMap<K, V>>>;
 ///
 /// We use [`BTreeMap`] internally so that the serialised output is consistent between runs,
 /// and is easy to inspect if something goes wrong.
-#[derive(Clone)]
 pub struct HierarchicalMap<K, L, V> {
     /// The prefix we use for (de)serializing this map.
     prefix: PathBuf,
@@ -34,6 +34,17 @@ pub struct HierarchicalMap<K, L, V> {
     #[allow(clippy::type_complexity)]
     shorten: Arc<Box<dyn Fn(&L) -> K + Send + Sync + 'static>>,
     map: LockedBTreeMap<K, LockedBTreeMap<L, V>>,
+}
+
+impl<K, L, V> Clone for HierarchicalMap<K, L, V> {
+    fn clone(&self) -> Self {
+        Self {
+            prefix: self.prefix.clone(),
+            fully_loaded: self.fully_loaded.clone(),
+            shorten: self.shorten.clone(),
+            map: self.map.clone(),
+        }
+    }
 }
 
 impl<K, L, V> Debug for HierarchicalMap<K, L, V> {
@@ -141,6 +152,35 @@ impl<K, L, V> HierarchicalMap<K, L, V> {
         }
     }
 
+    /// Mutates the given key-value pair,
+    /// starting with a default value if the key is not already in the map.
+    pub fn mutate_with_default(&self, key: L, mutate: impl FnOnce(&mut V))
+    where
+        K: Ord,
+        L: Ord,
+        V: Default,
+    {
+        let short_key = (self.shorten)(&key);
+        let guard = self.map.read().unwrap();
+        match guard.get(&short_key) {
+            Some(inner_map) => mutate(inner_map.write().unwrap().entry(key).or_default()),
+            None => {
+                drop(guard);
+                mutate(
+                    self.map
+                        .write()
+                        .unwrap()
+                        .entry(short_key)
+                        .or_default()
+                        .write()
+                        .unwrap()
+                        .entry(key)
+                        .or_default(),
+                )
+            }
+        }
+    }
+
     /// Obtains the value associated to the given key, applies `f` to it, and returns the result.
     /// If the key was not found, we check the cache on disk, and add the key-value pair to `self`.
     /// If the key was not found, and it cannot be found on disk, this returns [`None`].
@@ -181,6 +221,34 @@ impl<K, L, V> HierarchicalMap<K, L, V> {
             Ok(None) => None,
             Err(err) => panic!("{}\n{}", err, err.backtrace()),
         }
+    }
+
+    pub fn with_all<T>(
+        &self,
+        message: String,
+        f: impl Fn(&L, &V) -> T + Send + 'static,
+    ) -> Receiver<T>
+    where
+        K: Send + Sync + 'static,
+        L: Send + Sync + 'static,
+        V: Send + Sync + 'static,
+        T: Send + Sync + 'static,
+    {
+        assert!(self.is_fully_loaded());
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        let this = self.clone();
+        std::thread::spawn::<_, anyhow::Result<()>>(move || {
+            let progress_bar =
+                progress_bar::normal_progress_bar(this.total_keys() as u64).with_message(message);
+            for inner_map in this.map.read().unwrap().values() {
+                for (key, value) in inner_map.read().unwrap().iter() {
+                    tx.send(f(key, value))?;
+                    progress_bar.inc(1);
+                }
+            }
+            Ok(())
+        });
+        rx
     }
 
     /// Returns the underying map.

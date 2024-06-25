@@ -1,11 +1,11 @@
+pub mod binary_search_line;
 pub mod commands;
+pub mod hierarchical_map;
 pub mod memoise;
 pub mod page;
 pub mod parse;
 pub mod progress_bar;
-pub mod hierarchical_map;
 pub mod titles;
-pub mod binary_search_line;
 
 use clap::{Parser, Subcommand};
 
@@ -24,6 +24,8 @@ enum Commands {
     },
     /// Displays a random article
     Random {},
+    /// Displays the list of articles linked from an article
+    Links { article: String },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -32,5 +34,6 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Download { date } => commands::download::execute(date),
         Commands::Random {} => commands::random_article::execute(),
+        Commands::Links { article } => commands::links::execute(article),
     }
 }
