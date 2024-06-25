@@ -3,6 +3,8 @@ pub mod memoise;
 pub mod page;
 pub mod parse;
 pub mod progress_bar;
+pub mod hierarchical_map;
+pub mod titles;
 
 use clap::{Parser, Subcommand};
 

@@ -1,14 +1,15 @@
 use std::sync::Arc;
 
 use crate::{
-    page::{get_dump_status, id_to_title, page_stream},
+    page::{get_dump_status, page_stream},
     parse::wikitext::find_links,
+    titles::id_to_title,
 };
 
 pub fn execute() -> anyhow::Result<()> {
-    let dump_status = get_dump_status()?;
     let id_to_title = Arc::new(id_to_title()?);
 
+    /*
     let stream = page_stream(1, 1, "Scanning page links".to_owned(), move |page| {
         let id_to_title = id_to_title.clone();
         (
@@ -28,7 +29,7 @@ pub fn execute() -> anyhow::Result<()> {
 
     while let Ok((id, targets)) = stream.recv() {
         println!("Page {id} has {} link targets", targets.len());
-    }
+    } */
 
     Ok(())
 }

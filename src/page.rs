@@ -2,23 +2,20 @@ use std::{
     collections::HashMap,
     fmt::Debug,
     fs::File,
-    io::{BufRead, BufReader, ErrorKind, Read, Seek},
+    io::{BufRead, BufReader, Read, Seek},
     path::PathBuf,
     str::FromStr,
-    sync::{Arc, RwLock},
 };
 
-use bimap::BiBTreeMap;
 use bzip2::bufread::BzDecoder;
 use chrono::{DateTime, FixedOffset};
 use console::style;
 use crossbeam::channel::Receiver;
-use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     commands::download::DumpStatus,
-    memoise::{memoise, memoise_bytes, BytesSerde},
+    memoise::memoise,
     parse::xml::{make_errors_static, parse_element, parse_whitespace, shorten, Element},
     progress_bar::normal_progress_bar,
 };
@@ -226,148 +223,6 @@ impl ArticleCount {
 
     pub fn total(&self) -> u64 {
         self.articles_per_stream.values().sum()
-    }
-}
-
-pub fn id_to_title() -> anyhow::Result<TitleMap> {
-    // Gzipping here almost halves the binary file size and only increases processing time by a small amount.
-    memoise_bytes("id_to_title", "Precomputing page IDs", true, || {
-        let id_to_title = Arc::new(RwLock::new(BiBTreeMap::<u32, String>::new()));
-
-        let rx =
-            crate::page::page_stream(u64::MAX, 1, "Precomputing page IDs".to_owned(), |page| {
-                (page.id, page.title.to_owned())
-            })?;
-
-        while let Ok((id, title)) = rx.recv() {
-            id_to_title
-                .write()
-                .map_err(|_| anyhow::Error::msg("could not lock"))?
-                .insert(id, canonicalise_wikilink(&title));
-        }
-
-        let mut result = id_to_title
-            .write()
-            .map_err(|_| anyhow::Error::msg("could not lock"))?;
-        let result: &mut BiBTreeMap<u32, String> = &mut result;
-        Ok(TitleMap {
-            map: std::mem::take(result),
-        })
-    })
-}
-
-#[derive(Debug, Default)]
-pub struct TitleMap {
-    map: BiBTreeMap<u32, String>,
-}
-
-impl TitleMap {
-    pub fn get_title(&self, id: u32) -> Option<&str> {
-        self.map.get_by_left(&id).map(|x| x.as_str())
-    }
-
-    pub fn get_id(&self, title: &str) -> Option<u32> {
-        self.map
-            .get_by_right(&canonicalise_wikilink(title))
-            .copied()
-    }
-}
-
-/// <https://en.wikipedia.org/wiki/Help:Link#Conversion_to_canonical_form>
-pub fn canonicalise_wikilink(input: &str) -> String {
-    let (namespace, input) = match input.split_once(':') {
-        Some((namespace, remaining_input)) => {
-            let namespace = match namespace.trim().to_lowercase().as_str() {
-                "main" => Some("Main"),
-                "article" => Some("Article"),
-                "user" => Some("User"),
-                "wikipedia" => Some("Wikipedia"),
-                "file" => Some("File"),
-                "mediawiki" => Some("MediaWiki"),
-                "template" => Some("Template"),
-                "help" => Some("Help"),
-                "category" => Some("Category"),
-                "portal" => Some("Portal"),
-                "draft" => Some("Draft"),
-                "timedtext" => Some("TimedText"),
-                "module" => Some("Module"),
-                "special" => Some("Special"),
-                "media" => Some("Media"),
-                _ => None,
-            };
-            match namespace {
-                Some(namespace) => (Some(namespace), remaining_input),
-                None => (None, input),
-            }
-        }
-        None => (None, input),
-    };
-
-    let unescaped = String::from_utf8(percent_decode_str(input).collect::<Vec<_>>()).unwrap();
-    let unescaped = html_escape::decode_html_entities(&unescaped);
-
-    let title_case = unescaped
-        .chars()
-        .next()
-        .unwrap()
-        .to_uppercase()
-        .chain(input.chars().skip(1))
-        .collect::<String>();
-
-    let no_underscores = title_case
-        .replace("_", " ")
-        .split(' ')
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    match namespace {
-        Some(namespace) => format!("{namespace}:{no_underscores}"),
-        None => no_underscores,
-    }
-}
-
-impl BytesSerde for TitleMap {
-    fn serialize(&self, writer: &mut impl std::io::Write) -> anyhow::Result<()> {
-        for (key, value) in &self.map {
-            writer.write_all(&key.to_le_bytes())?;
-            writer.write_all(&(value.len() as u32).to_le_bytes())?;
-            writer.write_all(value.as_bytes())?;
-        }
-        Ok(())
-    }
-
-    fn deserialize(reader: &mut impl std::io::Read) -> anyhow::Result<Self> {
-        let mut result = Self::default();
-        let mut four_bytes = [0u8; 4];
-        loop {
-            match reader.read_exact(&mut four_bytes) {
-                Ok(()) => {
-                    let key = u32::from_le_bytes(four_bytes);
-                    reader.read_exact(&mut four_bytes)?;
-                    let len = u32::from_le_bytes(four_bytes);
-                    let mut value = vec![0u8; len as usize];
-                    reader.read_exact(&mut value)?;
-                    let string = String::from_utf8(value.clone());
-                    if let Err(err) = &string {
-                        eprintln!(
-                            "---\ndeserialisation error {} {} {value:?} {}\n---",
-                            key,
-                            len,
-                            String::from_utf8_lossy(&value)
-                        );
-                    }
-                    result.map.insert(key, string?);
-                }
-                Err(e) => {
-                    if e.kind() == ErrorKind::UnexpectedEof {
-                        break;
-                    } else {
-                        return Err(e.into());
-                    }
-                }
-            }
-        }
-        Ok(result)
     }
 }
 
