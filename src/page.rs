@@ -1,18 +1,20 @@
 use std::{
-    collections::HashMap, fmt::Debug, io::ErrorKind, path::PathBuf, str::FromStr, sync::Arc,
+    collections::HashMap,
+    fmt::Debug,
+    fs::File,
+    io::{BufRead, BufReader, ErrorKind, Read, Seek},
+    path::PathBuf,
+    str::FromStr,
+    sync::{Arc, RwLock},
 };
 
-use async_compression::tokio::bufread::BzDecoder;
 use bimap::BiBTreeMap;
+use bzip2::bufread::BzDecoder;
 use chrono::{DateTime, FixedOffset};
 use console::style;
+use crossbeam::channel::Receiver;
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
-use tokio::{
-    fs::File,
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader},
-    sync::RwLock,
-};
 
 use crate::{
     commands::download::DumpStatus,
@@ -23,11 +25,11 @@ use crate::{
 
 /// Yields some `'static` information about a page given by its ID.
 /// Don't use this function multiple times in quick succession: this opens the index and article files.
-pub async fn page_information<T: 'static>(
+pub fn page_information<T: 'static>(
     id: u32,
     information: impl for<'a> FnOnce(ParsedPage<'a>) -> T,
 ) -> anyhow::Result<T> {
-    let dump_status = get_dump_status().await?;
+    let dump_status = get_dump_status()?;
     let files = dump_status.jobs.articles_multistream_dump.files();
     for (_, articles) in files.iter().filter(|(file, _)| !file.contains("index")) {
         let index_url = articles
@@ -47,15 +49,15 @@ pub async fn page_information<T: 'static>(
         if start <= id && id <= end {
             // Search through the index file to find the right block to find the page.
             let mut articles_file =
-                tokio::fs::File::open(PathBuf::from_str("data")?.join(&articles.url)).await?;
+                std::fs::File::open(PathBuf::from_str("data")?.join(&articles.url))?;
             let articles_index_file =
-                tokio::fs::File::open(PathBuf::from_str("data")?.join(index_url)).await?;
-            let mut lines =
-                BufReader::new(BzDecoder::new(BufReader::new(articles_index_file))).lines();
+                std::fs::File::open(PathBuf::from_str("data")?.join(index_url))?;
+            let lines = BufReader::new(BzDecoder::new(BufReader::new(articles_index_file))).lines();
 
             let id_string = id.to_string();
 
-            while let Some(line) = lines.next_line().await? {
+            for line in lines {
+                let line = line?;
                 if line.is_empty() {
                     continue;
                 }
@@ -65,7 +67,7 @@ pub async fn page_information<T: 'static>(
 
                 if article_id == id_string {
                     let article_id = article_id.parse::<u32>()?;
-                    let pages = read_pages(&mut articles_file, byte_offset.parse()?).await?;
+                    let pages = read_pages(&mut articles_file, byte_offset.parse()?)?;
                     let mut input = pages.as_str();
                     while !input.is_empty() {
                         let (new_input, _) = make_errors_static(parse_whitespace(input))?;
@@ -87,15 +89,15 @@ pub async fn page_information<T: 'static>(
 
 /// Yields some `'static` information about every page.
 /// The `capacity` is the capacity of the internal buffer.
-pub async fn page_stream<T: Send + Sync + 'static>(
+pub fn page_stream<T: Send + Sync + 'static>(
     cutoff: u64,
     capacity: usize,
     message: String,
     information: impl for<'a> Fn(ParsedPage<'a>) -> T + Clone + Send + 'static,
-) -> anyhow::Result<async_channel::Receiver<T>> {
-    let dump_status = get_dump_status().await?;
+) -> anyhow::Result<Receiver<T>> {
+    let dump_status = get_dump_status()?;
 
-    let num_articles = count_articles(&dump_status).await?;
+    let num_articles = count_articles(&dump_status)?;
     num_articles.summarise();
 
     let max = if cutoff < num_articles.total() {
@@ -110,7 +112,7 @@ pub async fn page_stream<T: Send + Sync + 'static>(
 
     let progress_bar = normal_progress_bar(max).with_message(message);
 
-    let (tx, rx) = async_channel::bounded(capacity);
+    let (tx, rx) = crossbeam::channel::bounded(capacity);
 
     let files = dump_status.jobs.articles_multistream_dump.files();
     for (_, articles) in files.iter().filter(|(file, _)| !file.contains("index")) {
@@ -118,24 +120,23 @@ pub async fn page_stream<T: Send + Sync + 'static>(
         let articles = articles.clone();
         let tx = tx.clone();
         let information = information.clone();
-        tokio::task::spawn(async move {
+        std::thread::spawn(move || {
             let mut articles_file =
-                tokio::fs::File::open(PathBuf::from_str("data")?.join(&articles.url)).await?;
-            let articles_index_file = tokio::fs::File::open(
+                std::fs::File::open(PathBuf::from_str("data")?.join(&articles.url))?;
+            let articles_index_file = std::fs::File::open(
                 PathBuf::from_str("data")?.join(
-                    &articles
+                    articles
                         .url
                         .replace("multistream", "multistream-index")
                         .replace(".xml", ".txt"),
                 ),
-            )
-            .await?;
+            )?;
 
-            let mut lines =
-                BufReader::new(BzDecoder::new(BufReader::new(articles_index_file))).lines();
+            let lines = BufReader::new(BzDecoder::new(BufReader::new(articles_index_file))).lines();
             let mut latest_offset = 0;
 
-            while let Some(line) = lines.next_line().await? {
+            for line in lines {
+                let line = line?;
                 if line.is_empty() {
                     continue;
                 }
@@ -146,14 +147,14 @@ pub async fn page_stream<T: Send + Sync + 'static>(
 
                 if byte_offset > latest_offset {
                     latest_offset = byte_offset;
-                    let pages = read_pages(&mut articles_file, byte_offset).await?;
+                    let pages = read_pages(&mut articles_file, byte_offset)?;
                     let mut input = pages.as_str();
                     while !input.is_empty() {
                         let (new_input, _) = make_errors_static(parse_whitespace(input))?;
                         let (new_input, page) = make_errors_static(parse_element(new_input))?;
                         let (new_input, _) = make_errors_static(parse_whitespace(new_input))?;
                         input = new_input;
-                        tx.send(information(ParsedPage::from(page))).await?;
+                        tx.send(information(ParsedPage::from(page)))?;
                         progress_bar.inc(1);
                         if progress_bar.position() >= max {
                             return Ok(());
@@ -169,14 +170,14 @@ pub async fn page_stream<T: Send + Sync + 'static>(
     Ok(rx)
 }
 
-pub async fn get_dump_status() -> anyhow::Result<DumpStatus> {
+pub fn get_dump_status() -> anyhow::Result<DumpStatus> {
     Ok(serde_json::from_str::<DumpStatus>(
-        &tokio::fs::read_to_string("data/current_dump.json").await?,
+        &std::fs::read_to_string("data/current_dump.json")?,
     )?)
 }
 
-pub async fn count_articles(dump_status: &DumpStatus) -> anyhow::Result<ArticleCount> {
-    memoise("article_count", "Counting articles", false, || async {
+pub fn count_articles(dump_status: &DumpStatus) -> anyhow::Result<ArticleCount> {
+    memoise("article_count", "Counting articles", false, || {
         let mut output = ArticleCount::default();
         let files: Vec<(String, crate::commands::download::FileStatus)> =
             dump_status.jobs.articles_multistream_dump.files();
@@ -189,11 +190,11 @@ pub async fn count_articles(dump_status: &DumpStatus) -> anyhow::Result<ArticleC
         .with_message("Counting articles");
         for (file, articles) in files.iter().filter(|(file, _)| file.contains("index")) {
             let articles_index_file =
-                tokio::fs::File::open(PathBuf::from_str("data")?.join(&articles.url)).await?;
-            let mut lines =
-                BufReader::new(BzDecoder::new(BufReader::new(articles_index_file))).lines();
+                std::fs::File::open(PathBuf::from_str("data")?.join(&articles.url))?;
+            let lines = BufReader::new(BzDecoder::new(BufReader::new(articles_index_file))).lines();
             let mut num_articles = 0u64;
-            while let Some(line) = lines.next_line().await? {
+            for line in lines {
+                let line = line?;
                 if line.is_empty() {
                     continue;
                 }
@@ -207,7 +208,6 @@ pub async fn count_articles(dump_status: &DumpStatus) -> anyhow::Result<ArticleC
         progress_bar.finish();
         Ok(output)
     })
-    .await
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -229,31 +229,31 @@ impl ArticleCount {
     }
 }
 
-pub async fn id_to_title() -> anyhow::Result<TitleMap> {
+pub fn id_to_title() -> anyhow::Result<TitleMap> {
     // Gzipping here almost halves the binary file size and only increases processing time by a small amount.
-    memoise_bytes("id_to_title", "Precomputing page IDs", true, || async {
+    memoise_bytes("id_to_title", "Precomputing page IDs", true, || {
         let id_to_title = Arc::new(RwLock::new(BiBTreeMap::<u32, String>::new()));
 
         let rx =
             crate::page::page_stream(u64::MAX, 1, "Precomputing page IDs".to_owned(), |page| {
                 (page.id, page.title.to_owned())
-            })
-            .await?;
+            })?;
 
-        while let Ok((id, title)) = rx.recv().await {
+        while let Ok((id, title)) = rx.recv() {
             id_to_title
                 .write()
-                .await
+                .map_err(|_| anyhow::Error::msg("could not lock"))?
                 .insert(id, canonicalise_wikilink(&title));
         }
 
-        let mut result = id_to_title.write().await;
+        let mut result = id_to_title
+            .write()
+            .map_err(|_| anyhow::Error::msg("could not lock"))?;
         let result: &mut BiBTreeMap<u32, String> = &mut result;
         Ok(TitleMap {
             map: std::mem::take(result),
         })
     })
-    .await
 }
 
 #[derive(Debug, Default)]
@@ -373,13 +373,11 @@ impl BytesSerde for TitleMap {
 
 /// Reads the pages at the given byte offset in the supplied articles file.
 /// There are normally 100 pages in each substream.
-async fn read_pages(articles_file: &mut File, byte_offset: u64) -> anyhow::Result<String> {
-    articles_file
-        .seek(std::io::SeekFrom::Start(byte_offset))
-        .await?;
+fn read_pages(articles_file: &mut File, byte_offset: u64) -> anyhow::Result<String> {
+    articles_file.seek(std::io::SeekFrom::Start(byte_offset))?;
     let mut decoder = BzDecoder::new(BufReader::new(articles_file));
     let mut output = String::new();
-    decoder.read_to_string(&mut output).await?;
+    decoder.read_to_string(&mut output)?;
     Ok(output)
 }
 

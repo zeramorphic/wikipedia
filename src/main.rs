@@ -1,8 +1,8 @@
 pub mod commands;
+pub mod memoise;
 pub mod page;
 pub mod parse;
 pub mod progress_bar;
-pub mod memoise;
 
 use clap::{Parser, Subcommand};
 
@@ -15,17 +15,19 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Downloads Wikipedia data files
-    Download {},
+    Download {
+        #[arg(short, long)]
+        date: Option<String>,
+    },
     /// Displays a random article
     Random {},
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Download {} => commands::download::execute().await,
-        Commands::Random {} => commands::random_article::execute().await,
+        Commands::Download { date } => commands::download::execute(date),
+        Commands::Random {} => commands::random_article::execute(),
     }
 }

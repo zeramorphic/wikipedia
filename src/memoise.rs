@@ -1,5 +1,5 @@
 use std::{
-    future::Future,
+    io::{BufReader, BufWriter, Read, Write},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -7,144 +7,137 @@ use std::{
     time::Duration,
 };
 
-use async_compression::tokio::{bufread::GzipDecoder, write::GzipEncoder};
+use flate2::{
+    bufread::{GzDecoder, GzEncoder},
+    Compression,
+};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, BufReader, BufWriter};
-use tokio_util::io::SyncIoBridge;
 
 use crate::progress_bar::file_progress_bar;
 
 /// Stores the result of this function on disk and retrieves it when needed.
-pub async fn memoise<T, F>(
+pub fn memoise<T>(
     key: &str,
     name: &str,
     gz: bool,
-    f: impl FnOnce() -> F,
+    f: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T>
 where
     T: Serialize + for<'a> Deserialize<'a> + Send + 'static,
-    F: Future<Output = anyhow::Result<T>>,
 {
-    if let Ok(file) =
-        tokio::fs::File::open(format!("data/{key}.json{}", if gz { ".gz" } else { "" })).await
+    if let Ok(file) = std::fs::File::open(format!("data/{key}.json{}", if gz { ".gz" } else { "" }))
     {
-        let len = file.metadata().await?.len();
+        let len = file.metadata()?.len();
         let progress = Arc::new(AtomicUsize::new(0));
         let progress2 = Arc::clone(&progress);
-        let mut task = tokio::task::spawn_blocking(move || {
+        let task = std::thread::spawn(move || {
             if gz {
-                let reader = SyncIoBridge::new(GzipDecoder::new(BufReader::new(
-                    ReadProgressHook::new(file, progress2),
-                )));
+                let reader = GzDecoder::new(BufReader::new(ReadProgressHook::new(file, progress2)));
                 Ok(serde_json::from_reader(reader)?)
             } else {
-                let reader =
-                    SyncIoBridge::new(BufReader::new(ReadProgressHook::new(file, progress2)));
+                let reader = BufReader::new(ReadProgressHook::new(file, progress2));
                 Ok(serde_json::from_reader(reader)?)
             }
         });
         let progress_bar = file_progress_bar(len).with_message(format!("{name} (cached)"));
-        loop {
-            let result = tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                    progress_bar.set_position(progress.load(Ordering::SeqCst) as u64);
-                    None
-                },
-                result = &mut task => {
-                    Some(result)
-                },
-            };
-            if let Some(result) = result {
-                progress_bar.finish();
-                return result?;
-            }
+        while !task.is_finished() {
+            std::thread::sleep(Duration::from_millis(100));
+            progress_bar.set_position(progress.load(Ordering::SeqCst) as u64);
         }
+        progress_bar.finish();
+        task.join().map_err(|_| anyhow::Error::msg("panic"))?
     } else {
-        let result = f().await?;
+        let result = f()?;
         let file =
-            tokio::fs::File::create(format!("data/{key}.json{}", if gz { ".gz" } else { "" }))
-                .await?;
-        tokio::task::spawn_blocking(move || {
-            if gz {
-                let mut encoder = SyncIoBridge::new(GzipEncoder::new(BufWriter::new(file)));
-                serde_json::to_writer(&mut encoder, &result)?;
-                encoder.shutdown()?;
-                Ok(result)
-            } else {
-                let mut encoder = SyncIoBridge::new(BufWriter::new(file));
-                serde_json::to_writer(&mut encoder, &result)?;
-                encoder.shutdown()?;
-                Ok(result)
-            }
-        })
-        .await?
+            std::fs::File::create(format!("data/{key}.json{}", if gz { ".gz" } else { "" }))?;
+
+        if gz {
+            let (reader, mut writer) = pipe::pipe();
+            let task = std::thread::spawn::<_, anyhow::Result<()>>(move || {
+                let mut encoder = GzEncoder::new(reader, Compression::best());
+                let mut writer = BufWriter::new(file);
+                std::io::copy(&mut encoder, &mut writer)?;
+                writer.flush()?;
+                Ok(())
+            });
+            serde_json::to_writer(&mut writer, &result)?;
+            task.join().map_err(|_| anyhow::Error::msg("panic"))??;
+            Ok(result)
+        } else {
+            let (mut reader, mut writer) = pipe::pipe();
+            let task = std::thread::spawn::<_, anyhow::Result<()>>(move || {
+                let mut writer = BufWriter::new(file);
+                std::io::copy(&mut reader, &mut writer)?;
+                writer.flush()?;
+                Ok(())
+            });
+            serde_json::to_writer(&mut writer, &result)?;
+            task.join().map_err(|_| anyhow::Error::msg("panic"))??;
+            Ok(result)
+        }
     }
 }
 
 /// Stores the result of this function on disk and retrieves it when needed.
-pub async fn memoise_bytes<T, F>(
+pub fn memoise_bytes<T>(
     key: &str,
     name: &str,
     gz: bool,
-    f: impl FnOnce() -> F,
+    f: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T>
 where
     T: BytesSerde + Send + 'static,
-    F: Future<Output = anyhow::Result<T>>,
 {
-    if let Ok(file) =
-        tokio::fs::File::open(format!("data/{key}.bin{}", if gz { ".gz" } else { "" })).await
+    if let Ok(file) = std::fs::File::open(format!("data/{key}.bin{}", if gz { ".gz" } else { "" }))
     {
-        let len = file.metadata().await?.len();
+        let len = file.metadata()?.len();
         let progress = Arc::new(AtomicUsize::new(0));
         let progress2 = Arc::clone(&progress);
-        let mut task = tokio::task::spawn_blocking(move || {
+        let task = std::thread::spawn(move || {
             if gz {
-                let mut reader = SyncIoBridge::new(GzipDecoder::new(BufReader::new(
-                    ReadProgressHook::new(file, progress2),
-                )));
+                let mut reader =
+                    GzDecoder::new(BufReader::new(ReadProgressHook::new(file, progress2)));
                 Ok(<T as BytesSerde>::deserialize(&mut reader)?)
             } else {
-                let mut reader =
-                    SyncIoBridge::new(BufReader::new(ReadProgressHook::new(file, progress2)));
+                let mut reader = BufReader::new(ReadProgressHook::new(file, progress2));
                 Ok(<T as BytesSerde>::deserialize(&mut reader)?)
             }
         });
         let progress_bar = file_progress_bar(len).with_message(format!("{name} (cached)"));
-        loop {
-            let result = tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                    progress_bar.set_position(progress.load(Ordering::SeqCst) as u64);
-                    None
-                },
-                result = &mut task => {
-                    Some(result)
-                },
-            };
-            if let Some(result) = result {
-                progress_bar.finish();
-                return result?;
-            }
+        while !task.is_finished() {
+            std::thread::sleep(Duration::from_millis(100));
+            progress_bar.set_position(progress.load(Ordering::SeqCst) as u64);
         }
+        progress_bar.finish();
+        task.join().map_err(|_| anyhow::Error::msg("panic"))?
     } else {
-        let result = f().await?;
-        let file =
-            tokio::fs::File::create(format!("data/{key}.bin{}", if gz { ".gz" } else { "" }))
-                .await?;
-        tokio::task::spawn_blocking(move || {
-            if gz {
-                let mut encoder = SyncIoBridge::new(GzipEncoder::new(BufWriter::new(file)));
-                result.serialize(&mut encoder)?;
-                encoder.shutdown()?;
-                Ok(result)
-            } else {
-                let mut encoder = SyncIoBridge::new(BufWriter::new(file));
-                result.serialize(&mut encoder)?;
-                encoder.shutdown()?;
-                Ok(result)
-            }
-        })
-        .await?
+        let result = f()?;
+        let file = std::fs::File::create(format!("data/{key}.bin{}", if gz { ".gz" } else { "" }))?;
+
+        if gz {
+            let (reader, mut writer) = pipe::pipe();
+            let task = std::thread::spawn::<_, anyhow::Result<()>>(move || {
+                let mut encoder = GzEncoder::new(reader, Compression::best());
+                let mut writer = BufWriter::new(file);
+                std::io::copy(&mut encoder, &mut writer)?;
+                writer.flush()?;
+                Ok(())
+            });
+            result.serialize(&mut writer)?;
+            task.join().map_err(|_| anyhow::Error::msg("panic"))??;
+            Ok(result)
+        } else {
+            let (mut reader, mut writer) = pipe::pipe();
+            let task = std::thread::spawn::<_, anyhow::Result<()>>(move || {
+                let mut writer = BufWriter::new(file);
+                std::io::copy(&mut reader, &mut writer)?;
+                writer.flush()?;
+                Ok(())
+            });
+            result.serialize(&mut writer)?;
+            task.join().map_err(|_| anyhow::Error::msg("panic"))??;
+            Ok(result)
+        }
     }
 }
 
@@ -154,9 +147,7 @@ pub trait BytesSerde: Sized {
     fn deserialize(reader: &mut impl std::io::Read) -> anyhow::Result<Self>;
 }
 
-#[pin_project::pin_project]
 struct ReadProgressHook<R> {
-    #[pin]
     inner: R,
     progress: Arc<AtomicUsize>,
 }
@@ -167,21 +158,14 @@ impl<R> ReadProgressHook<R> {
     }
 }
 
-impl<R> AsyncRead for ReadProgressHook<R>
+impl<R> Read for ReadProgressHook<R>
 where
-    R: AsyncRead,
+    R: Read,
 {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let this = self.project();
-        let unfilled = buf.filled().len();
-        let result = this.inner.poll_read(cx, buf);
-        let difference = buf.filled().len() - unfilled;
-        this.progress
-            .fetch_add(difference, std::sync::atomic::Ordering::SeqCst);
-        result
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let result = self.inner.read(buf)?;
+        self.progress
+            .fetch_add(result, std::sync::atomic::Ordering::SeqCst);
+        Ok(result)
     }
 }

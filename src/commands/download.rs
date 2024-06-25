@@ -1,75 +1,99 @@
-use std::{collections::BTreeMap, path::PathBuf, str::FromStr, time::Duration};
+use std::{
+    collections::BTreeMap,
+    io::{BufReader, BufWriter, Read, Write},
+    path::PathBuf,
+    str::FromStr,
+    time::Duration,
+};
 
 use chrono::{DateTime, Utc};
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncWriteExt, BufWriter};
+use ureq::{Agent, AgentBuilder};
 
 use crate::progress_bar::file_progress_bar;
 
 /// Executes the download command.
-pub async fn execute() -> anyhow::Result<()> {
+pub fn execute(date: Option<String>) -> anyhow::Result<()> {
     let spinner = ProgressBar::new_spinner()
         .with_style(ProgressStyle::with_template("{spinner:.green} {wide_msg}").unwrap());
     spinner.enable_steady_tick(Duration::from_millis(100));
 
     spinner.set_message("Downloading dumps list");
 
-    let client = Client::builder()
+    let agent = AgentBuilder::new()
         .user_agent("wiki-scraper-zeramorphic")
-        .build()?;
+        .build();
 
-    // Obtain a list of the most recent available file dumps, e.g.
-    // ["20240301/", "20240320/", "20240401/", "20240420/", "20240501/", "20240601/", "20240620/", "latest/"]
-    let response = client
-        .get("https://dumps.wikimedia.org/enwiki/")
-        .send()
-        .await?
-        .error_for_status()?;
-    let file_names = crate::parse::parse_html_index::file_names(&response.text().await?)?;
+    match date {
+        Some(date) => {
+            spinner.set_message(format!(
+                "Downloading dump information for version {}",
+                style(&date).bright().bold()
+            ));
+            let response = agent
+                .get(&format!(
+                    "https://dumps.wikimedia.org/enwiki/{date}/dumpstatus.json"
+                ))
+                .call()?;
+            let text = response.into_string()?;
+            let mut dump_status = serde_json::from_str::<DumpStatus>(&text)?;
+            dump_status.fix_paths();
+            dump_status.date = Some(date.clone());
 
-    // Iterate through the dumps in reverse order until we find a dump that's already finished.
-    // This way we're always looking at the most recent completed dump.
-    for dir in file_names.into_iter().rev() {
-        let dir = dir.trim_end_matches('/');
-        if dir.contains("latest") {
-            continue;
+            assert!(dump_status.jobs.done());
+            spinner.finish_with_message(format!("Using version {}", style(date).bright().bold()));
+            execute_dump(&agent, dump_status)
         }
-        spinner.set_message(format!(
-            "Downloading dump information for version {}",
-            style(dir).bright().bold()
-        ));
-        let response = client
-            .get(format!(
-                "https://dumps.wikimedia.org/enwiki/{dir}/dumpstatus.json"
-            ))
-            .send()
-            .await?
-            .error_for_status()?;
-        let text = response.text().await?;
-        let mut dump_status = serde_json::from_str::<DumpStatus>(&text)?;
-        dump_status.fix_paths();
-        dump_status.date = Some(dir.to_owned());
+        None => {
+            // Obtain a list of the most recent available file dumps, e.g.
+            // ["20240301/", "20240320/", "20240401/", "20240420/", "20240501/", "20240601/", "20240620/", "latest/"]
+            let response = agent.get("https://dumps.wikimedia.org/enwiki/").call()?;
+            let file_names = crate::parse::parse_html_index::file_names(&response.into_string()?)?;
 
-        if dump_status.jobs.done() {
-            spinner.finish_with_message(format!("Using version {}", style(dir).bright().bold()));
-            return execute_dump(&client, dump_status).await;
+            // Iterate through the dumps in reverse order until we find a dump that's already finished.
+            // This way we're always looking at the most recent completed dump.
+            for dir in file_names.into_iter().rev() {
+                let dir = dir.trim_end_matches('/');
+                if dir.contains("latest") {
+                    continue;
+                }
+                spinner.set_message(format!(
+                    "Downloading dump information for version {}",
+                    style(dir).bright().bold()
+                ));
+                let response = agent
+                    .get(&format!(
+                        "https://dumps.wikimedia.org/enwiki/{dir}/dumpstatus.json"
+                    ))
+                    .call()?;
+                let text = response.into_string()?;
+                let mut dump_status = serde_json::from_str::<DumpStatus>(&text)?;
+                dump_status.fix_paths();
+                dump_status.date = Some(dir.to_owned());
+
+                if dump_status.jobs.done() {
+                    spinner.finish_with_message(format!(
+                        "Using version {}",
+                        style(dir).bright().bold()
+                    ));
+                    return execute_dump(&agent, dump_status);
+                }
+            }
+
+            Err(anyhow::Error::msg("no dump found"))
         }
     }
-
-    Err(anyhow::Error::msg("no dump found"))
 }
 
 /// Download this completed dump.
-async fn execute_dump(client: &Client, dump_status: DumpStatus) -> anyhow::Result<()> {
-    tokio::fs::create_dir_all("data").await?;
-    tokio::fs::write(
+fn execute_dump(agent: &Agent, dump_status: DumpStatus) -> anyhow::Result<()> {
+    std::fs::create_dir_all("data")?;
+    std::fs::write(
         "data/current_dump.json",
         serde_json::to_string_pretty(&dump_status)?,
-    )
-    .await?;
+    )?;
 
     let multi_progress = MultiProgress::new();
 
@@ -82,7 +106,7 @@ async fn execute_dump(client: &Client, dump_status: DumpStatus) -> anyhow::Resul
     for (file, status) in all_files {
         main_progress.set_message(format!("Downloading {file}"));
         let file_progress = file_progress_bar(status.size);
-        download_file(client, &status, &file_progress).await?;
+        download_file(agent, &status, &file_progress)?;
         main_progress.inc(1);
         multi_progress.remove(&file_progress);
     }
@@ -92,40 +116,38 @@ async fn execute_dump(client: &Client, dump_status: DumpStatus) -> anyhow::Resul
     Ok(())
 }
 
-async fn download_file(
-    client: &Client,
-    status: &FileStatus,
-    progress: &ProgressBar,
-) -> anyhow::Result<()> {
+fn download_file(agent: &Agent, status: &FileStatus, progress: &ProgressBar) -> anyhow::Result<()> {
     let local_path = PathBuf::from_str("data").unwrap().join(&status.url);
-    if tokio::fs::metadata(&local_path)
-        .await
-        .is_ok_and(|metadata| metadata.is_file())
-    {
+    if std::fs::metadata(&local_path).is_ok_and(|metadata| metadata.is_file()) {
         // We already downloaded the file; exit early.
         return Ok(());
     }
 
     let url = format!("https://dumps.wikimedia.org/{}", status.url);
-    let mut response = client.get(url).send().await?.error_for_status()?;
+    let response = agent.get(&url).call()?;
 
     // The response succeeded, so let's create the local file.
-    tokio::fs::create_dir_all(local_path.parent().unwrap()).await?;
-    let output = tokio::fs::File::create(local_path).await?;
+    std::fs::create_dir_all(local_path.parent().unwrap())?;
+    let output = std::fs::File::create(local_path)?;
     let mut writer = BufWriter::new(output);
 
     let mut md5_context = md5::Context::new();
-
-    while let Some(chunk) = response.chunk().await? {
-        progress.inc(chunk.len() as u64);
-        writer.write_all(&chunk).await?;
-        md5_context.consume(chunk);
+    let mut reader = BufReader::new(response.into_reader());
+    let mut buf = vec![0u8; 0x10000];
+    loop {
+        let bytes_read = reader.read(&mut buf)?;
+        if bytes_read == 0 {
+            break;
+        }
+        progress.inc(bytes_read as u64);
+        writer.write_all(&buf[0..bytes_read])?;
+        md5_context.consume(&buf[0..bytes_read]);
     }
 
     let digest = format!("{:x}", md5_context.compute());
     assert_eq!(status.md5, digest);
 
-    writer.flush().await?;
+    writer.flush()?;
     Ok(())
 }
 
@@ -229,7 +251,7 @@ mod custom_date_format {
     use chrono::{DateTime, NaiveDateTime, Utc};
     use serde::{self, Deserialize, Deserializer, Serializer};
 
-    const FORMAT: &'static str = "%Y-%m-%d %H:%M:%S";
+    const FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 
     pub fn serialize<S>(date: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
     where
