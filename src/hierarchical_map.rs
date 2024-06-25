@@ -188,7 +188,7 @@ impl<K, L, V> HierarchicalMap<K, L, V> {
 
     /// Serialises this hierarchical map using `self.prefix`, which should be something like `folder/information`.
     /// The output will be a file of the form `folder/information.json`, and a folder `folder/information/` which
-    /// will contain a bz2 file for each short key used.
+    /// will contain a `jsonl` file for each short key used.
     pub fn serialize(&self) -> anyhow::Result<()>
     where
         K: Send + Sync + Serialize + Display,

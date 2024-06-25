@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use bzip2::bufread::BzDecoder;
 use chrono::{DateTime, Utc};
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -117,7 +118,13 @@ fn execute_dump(agent: &Agent, dump_status: DumpStatus) -> anyhow::Result<()> {
 }
 
 fn download_file(agent: &Agent, status: &FileStatus, progress: &ProgressBar) -> anyhow::Result<()> {
-    let local_path = PathBuf::from_str("data").unwrap().join(&status.url);
+    // Special case: BZ2-decompress index files.
+    let is_index = status.url.contains("index");
+
+    let mut local_path = PathBuf::from_str("data").unwrap().join(&status.url);
+    if is_index {
+        local_path.set_extension("txt");
+    };
     if std::fs::metadata(&local_path).is_ok_and(|metadata| metadata.is_file()) {
         // We already downloaded the file; exit early.
         return Ok(());
@@ -132,7 +139,13 @@ fn download_file(agent: &Agent, status: &FileStatus, progress: &ProgressBar) -> 
     let mut writer = BufWriter::new(output);
 
     let mut md5_context = md5::Context::new();
-    let mut reader = BufReader::new(response.into_reader());
+    let mut reader: Box<dyn Read> = if is_index {
+        Box::new(BufReader::new(BzDecoder::new(BufReader::new(
+            response.into_reader(),
+        ))))
+    } else {
+        Box::new(BufReader::new(response.into_reader()))
+    };
     let mut buf = vec![0u8; 0x10000];
     loop {
         let bytes_read = reader.read(&mut buf)?;
@@ -145,7 +158,11 @@ fn download_file(agent: &Agent, status: &FileStatus, progress: &ProgressBar) -> 
     }
 
     let digest = format!("{:x}", md5_context.compute());
-    assert_eq!(status.md5, digest);
+    if !is_index {
+        // For now we just ignore the MD5 hash of index files, because
+        // we're actually calculating the decompressed digest.
+        assert_eq!(status.md5, digest);
+    }
 
     writer.flush()?;
     Ok(())

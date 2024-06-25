@@ -32,9 +32,10 @@ pub fn page_information<T: 'static>(
         let index_url = articles
             .url
             .replace("multistream", "multistream-index")
-            .replace(".xml", ".txt");
+            .replace(".xml", ".txt")
+            .replace(".bz2", ".txt");
         let (_, suffix) = index_url.split_once(".txt-").unwrap();
-        let suffix = suffix.strip_suffix(".bz2").unwrap();
+        let suffix = suffix.strip_suffix(".txt").unwrap();
         let [start, end]: [&str; 2] = suffix
             .split(|c: char| !c.is_numeric())
             .filter(|s| !s.is_empty())
@@ -48,8 +49,8 @@ pub fn page_information<T: 'static>(
             let mut articles_file =
                 std::fs::File::open(PathBuf::from_str("data")?.join(&articles.url))?;
             let articles_index_file =
-                std::fs::File::open(PathBuf::from_str("data")?.join(index_url))?;
-            let lines = BufReader::new(BzDecoder::new(BufReader::new(articles_index_file))).lines();
+                std::fs::File::open(PathBuf::from_str("data")?.join(&index_url))?;
+            let lines = BufReader::new(articles_index_file).lines();
 
             let id_string = id.to_string();
 
@@ -125,11 +126,12 @@ pub fn page_stream<T: Send + Sync + 'static>(
                     articles
                         .url
                         .replace("multistream", "multistream-index")
-                        .replace(".xml", ".txt"),
+                        .replace(".xml", ".txt")
+                        .replace(".bz2", ".txt"),
                 ),
             )?;
 
-            let lines = BufReader::new(BzDecoder::new(BufReader::new(articles_index_file))).lines();
+            let lines = BufReader::new(articles_index_file).lines();
             let mut latest_offset = 0;
 
             for line in lines {
@@ -188,7 +190,7 @@ pub fn count_articles(dump_status: &DumpStatus) -> anyhow::Result<ArticleCount> 
         for (file, articles) in files.iter().filter(|(file, _)| file.contains("index")) {
             let articles_index_file =
                 std::fs::File::open(PathBuf::from_str("data")?.join(&articles.url))?;
-            let lines = BufReader::new(BzDecoder::new(BufReader::new(articles_index_file))).lines();
+            let lines = BufReader::new(articles_index_file).lines();
             let mut num_articles = 0u64;
             for line in lines {
                 let line = line?;
@@ -290,9 +292,7 @@ impl<'a> From<Element<'a>> for ParsedRevision<'a> {
         for child in value.children {
             match child.name {
                 "id" => result.id = child.text.parse().unwrap(),
-                "timestamp" => {
-                    result.timestamp = DateTime::parse_from_rfc3339(&child.text).unwrap()
-                }
+                "timestamp" => result.timestamp = DateTime::parse_from_rfc3339(child.text).unwrap(),
                 "model" => result.model = child.text,
                 "format" => result.format = child.text,
                 "text" => result.text = child.text,
