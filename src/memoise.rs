@@ -22,7 +22,7 @@ pub async fn memoise<T, F>(
     f: impl FnOnce() -> F,
 ) -> anyhow::Result<T>
 where
-    T: Serialize + Send + for<'a> Deserialize<'a> + 'static,
+    T: Serialize + for<'a> Deserialize<'a> + Send + 'static,
     F: Future<Output = anyhow::Result<T>>,
 {
     if let Ok(file) =
@@ -79,6 +79,79 @@ where
         })
         .await?
     }
+}
+
+/// Stores the result of this function on disk and retrieves it when needed.
+pub async fn memoise_bytes<T, F>(
+    key: &str,
+    name: &str,
+    gz: bool,
+    f: impl FnOnce() -> F,
+) -> anyhow::Result<T>
+where
+    T: BytesSerde + Send + 'static,
+    F: Future<Output = anyhow::Result<T>>,
+{
+    if let Ok(file) =
+        tokio::fs::File::open(format!("data/{key}.bin{}", if gz { ".gz" } else { "" })).await
+    {
+        let len = file.metadata().await?.len();
+        let progress = Arc::new(AtomicUsize::new(0));
+        let progress2 = Arc::clone(&progress);
+        let mut task = tokio::task::spawn_blocking(move || {
+            if gz {
+                let mut reader = SyncIoBridge::new(GzipDecoder::new(BufReader::new(
+                    ReadProgressHook::new(file, progress2),
+                )));
+                Ok(<T as BytesSerde>::deserialize(&mut reader)?)
+            } else {
+                let mut reader =
+                    SyncIoBridge::new(BufReader::new(ReadProgressHook::new(file, progress2)));
+                Ok(<T as BytesSerde>::deserialize(&mut reader)?)
+            }
+        });
+        let progress_bar = file_progress_bar(len).with_message(format!("{name} (cached)"));
+        loop {
+            let result = tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    progress_bar.set_position(progress.load(Ordering::SeqCst) as u64);
+                    None
+                },
+                result = &mut task => {
+                    Some(result)
+                },
+            };
+            if let Some(result) = result {
+                progress_bar.finish();
+                return result?;
+            }
+        }
+    } else {
+        let result = f().await?;
+        let file =
+            tokio::fs::File::create(format!("data/{key}.bin{}", if gz { ".gz" } else { "" }))
+                .await?;
+        tokio::task::spawn_blocking(move || {
+            if gz {
+                let mut encoder = SyncIoBridge::new(GzipEncoder::new(BufWriter::new(file)));
+                result.serialize(&mut encoder)?;
+                encoder.shutdown()?;
+                Ok(result)
+            } else {
+                let mut encoder = SyncIoBridge::new(BufWriter::new(file));
+                result.serialize(&mut encoder)?;
+                encoder.shutdown()?;
+                Ok(result)
+            }
+        })
+        .await?
+    }
+}
+
+/// A trait for more efficient serialisation and deserialisation mechanisms.
+pub trait BytesSerde: Sized {
+    fn serialize(&self, writer: &mut impl std::io::Write) -> anyhow::Result<()>;
+    fn deserialize(reader: &mut impl std::io::Read) -> anyhow::Result<Self>;
 }
 
 #[pin_project::pin_project]
