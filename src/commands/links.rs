@@ -33,7 +33,7 @@ pub fn execute(article: String) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn generate_outgoing_links(full: bool) -> anyhow::Result<HierarchicalMap<u8, u32, Vec<u32>>> {
+pub fn generate_outgoing_links(full: bool) -> anyhow::Result<HierarchicalMap<u8, u32, Vec<u32>>> {
     let map = HierarchicalMap::new(PathBuf::from("outgoing_links"), id_short_key);
     if map.deserialize(full)? {
         return Ok(map);
@@ -89,7 +89,7 @@ fn generate_outgoing_links(full: bool) -> anyhow::Result<HierarchicalMap<u8, u32
     Ok(map)
 }
 
-fn generate_incoming_links(full: bool) -> anyhow::Result<HierarchicalMap<u8, u32, Vec<u32>>> {
+pub fn generate_incoming_links(full: bool) -> anyhow::Result<HierarchicalMap<u8, u32, Vec<u32>>> {
     let map = HierarchicalMap::new(PathBuf::from("incoming_links"), id_short_key);
     if map.deserialize(full)? {
         return Ok(map);

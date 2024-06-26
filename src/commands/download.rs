@@ -168,7 +168,7 @@ fn download_file(agent: &Agent, status: &FileStatus, progress: &ProgressBar) -> 
     Ok(())
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DumpStatus {
     pub date: Option<String>,
     pub jobs: JobsStatus,
@@ -181,7 +181,7 @@ impl DumpStatus {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobsStatus {
     #[serde(rename = "sitestatstable")]
     pub site_stats: JobStatus,
@@ -216,7 +216,7 @@ impl JobsStatus {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "lowercase")]
 pub enum JobStatus {
     Done {
@@ -260,7 +260,7 @@ pub struct FileStatus {
     pub md5: String,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WikiDateTime(#[serde(with = "custom_date_format")] pub DateTime<Utc>);
 
 #[allow(dead_code)]

@@ -26,6 +26,10 @@ enum Commands {
     Random {},
     /// Displays the list of articles linked from an article
     Links { article: String },
+    /// Finds the shortest path between the two articles
+    Path { start: String, end: String },
+    /// Finds some long shortest paths between two articles
+    LongPaths {},
 }
 
 fn main() -> anyhow::Result<()> {
@@ -35,5 +39,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Download { date } => commands::download::execute(date),
         Commands::Random {} => commands::random_article::execute(),
         Commands::Links { article } => commands::links::execute(article),
+        Commands::Path { start, end } => commands::shortest_path::execute(start, end),
+        Commands::LongPaths {} => commands::long_paths::execute(),
     }
 }
